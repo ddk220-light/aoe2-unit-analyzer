@@ -1,0 +1,970 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>4v4 Team Advisor - AoE2 Unit Analyzer</title>
+        <style>
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+
+            body {
+                font-family:
+                    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                    Oxygen, Ubuntu, sans-serif;
+                background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+                color: #e4e4e4;
+                min-height: 100vh;
+                padding: 20px;
+            }
+
+            .container {
+                max-width: 1400px;
+                margin: 0 auto;
+            }
+
+            header {
+                text-align: center;
+                margin-bottom: 30px;
+            }
+
+            h1 {
+                font-size: 2.5rem;
+                background: linear-gradient(90deg, #ffd700, #ff8c00);
+                -webkit-background-clip: text;
+                -webkit-text-fill-color: transparent;
+                background-clip: text;
+                margin-bottom: 10px;
+            }
+
+            .subtitle {
+                color: #888;
+                font-size: 1.1rem;
+            }
+
+            .nav-links {
+                display: flex;
+                justify-content: center;
+                gap: 20px;
+                margin-top: 20px;
+                flex-wrap: wrap;
+            }
+            .nav-link {
+                color: #888;
+                text-decoration: none;
+                padding: 8px 16px;
+                border-radius: 20px;
+                transition: all 0.3s;
+            }
+            .nav-link:hover {
+                color: #ffd700;
+                background: rgba(255, 215, 0, 0.1);
+            }
+            .nav-link.active {
+                color: #ffd700;
+                background: rgba(255, 215, 0, 0.2);
+            }
+
+            /* --- Team Selector --- */
+            .team-selector {
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 20px;
+                margin-bottom: 20px;
+            }
+            @media (max-width: 800px) {
+                .team-selector { grid-template-columns: 1fr; }
+            }
+            .team-panel {
+                background: rgba(255, 255, 255, 0.03);
+                border: 2px solid rgba(255, 255, 255, 0.08);
+                border-radius: 12px;
+                padding: 16px;
+            }
+            .team-panel.team1 { border-color: rgba(255, 107, 107, 0.3); }
+            .team-panel.team2 { border-color: rgba(78, 205, 196, 0.3); }
+            .team-label {
+                font-size: 1.1rem;
+                font-weight: 700;
+                margin-bottom: 12px;
+                text-align: center;
+            }
+            .team1 .team-label { color: #ff6b6b; }
+            .team2 .team-label { color: #4ecdc4; }
+
+            .team-picks {
+                display: flex;
+                gap: 8px;
+                justify-content: center;
+                margin-bottom: 12px;
+                flex-wrap: wrap;
+            }
+            .pick-slot {
+                width: 80px;
+                height: 80px;
+                border: 2px dashed rgba(255, 255, 255, 0.15);
+                border-radius: 8px;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                font-size: 0.7rem;
+                color: #666;
+                position: relative;
+                cursor: pointer;
+                transition: all 0.2s;
+            }
+            .pick-slot.filled {
+                border-style: solid;
+                background: rgba(255, 255, 255, 0.05);
+            }
+            .team1 .pick-slot.filled { border-color: rgba(255, 107, 107, 0.5); }
+            .team2 .pick-slot.filled { border-color: rgba(78, 205, 196, 0.5); }
+            .pick-slot .pick-emblem {
+                width: 40px;
+                height: 40px;
+                border-radius: 4px;
+            }
+            .pick-slot .pick-name {
+                font-size: 0.65rem;
+                margin-top: 2px;
+                text-align: center;
+                max-width: 72px;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+            .pick-slot .remove-btn {
+                position: absolute;
+                top: -6px;
+                right: -6px;
+                width: 18px;
+                height: 18px;
+                border-radius: 50%;
+                background: #e74c3c;
+                color: #fff;
+                border: none;
+                font-size: 10px;
+                cursor: pointer;
+                display: none;
+                align-items: center;
+                justify-content: center;
+                line-height: 1;
+            }
+            .pick-slot.filled:hover .remove-btn { display: flex; }
+
+            .civ-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fill, minmax(72px, 1fr));
+                gap: 6px;
+            }
+            .civ-card {
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                padding: 6px 4px;
+                background: rgba(255, 255, 255, 0.05);
+                border: 2px solid rgba(255, 255, 255, 0.1);
+                border-radius: 6px;
+                cursor: pointer;
+                transition: all 0.2s ease;
+                color: #e4e4e4;
+            }
+            .civ-card:hover:not(.disabled) {
+                transform: translateY(-1px);
+                border-color: rgba(255, 215, 0, 0.3);
+            }
+            .civ-card.selected-team1 {
+                border-color: #ff6b6b;
+                background: rgba(255, 107, 107, 0.15);
+            }
+            .civ-card.selected-team2 {
+                border-color: #4ecdc4;
+                background: rgba(78, 205, 196, 0.15);
+            }
+            .civ-card.disabled {
+                opacity: 0.3;
+                cursor: not-allowed;
+                pointer-events: none;
+            }
+            .civ-emblem {
+                width: 36px;
+                height: 36px;
+                border-radius: 4px;
+            }
+            .civ-card-name {
+                font-size: 0.6rem;
+                text-align: center;
+                margin-top: 2px;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                max-width: 64px;
+            }
+
+            /* --- Analyze Button --- */
+            .compare-btn {
+                display: block;
+                margin: 20px auto;
+                padding: 14px 40px;
+                font-size: 1.1rem;
+                font-weight: 700;
+                color: #1a1a2e;
+                background: linear-gradient(135deg, #ffd700, #ff8c00);
+                border: none;
+                border-radius: 8px;
+                cursor: pointer;
+                transition: all 0.3s;
+            }
+            .compare-btn:disabled {
+                opacity: 0.3;
+                cursor: not-allowed;
+            }
+            .compare-btn:not(:disabled):hover {
+                transform: translateY(-2px);
+                box-shadow: 0 8px 25px rgba(255, 215, 0, 0.3);
+            }
+
+            /* --- Age Tabs --- */
+            .age-tabs {
+                display: flex;
+                justify-content: center;
+                gap: 12px;
+                margin-bottom: 20px;
+            }
+            .age-tab {
+                padding: 8px 24px;
+                border-radius: 20px;
+                cursor: pointer;
+                border: 2px solid rgba(255, 215, 0, 0.2);
+                background: transparent;
+                color: #888;
+                font-weight: 600;
+                transition: all 0.3s;
+            }
+            .age-tab.active {
+                background: rgba(255, 215, 0, 0.15);
+                color: #ffd700;
+                border-color: rgba(255, 215, 0, 0.5);
+            }
+            .age-tab:hover:not(.active) {
+                border-color: rgba(255, 215, 0, 0.4);
+                color: #ccc;
+            }
+
+            /* --- Results --- */
+            .results-container { display: none; }
+            .results-container.visible { display: block; }
+
+            .section-title {
+                font-size: 1.3rem;
+                font-weight: 700;
+                margin: 24px 0 12px;
+                padding-bottom: 6px;
+                border-bottom: 1px solid rgba(255, 215, 0, 0.2);
+                color: #ffd700;
+            }
+
+            /* Bonuses */
+            .bonuses-row {
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 16px;
+                margin-bottom: 20px;
+            }
+            @media (max-width: 700px) {
+                .bonuses-row { grid-template-columns: 1fr; }
+            }
+            .bonus-panel {
+                background: rgba(255, 255, 255, 0.04);
+                border-radius: 8px;
+                padding: 12px 16px;
+                border-left: 4px solid;
+            }
+            .bonus-panel.t1 { border-color: #ff6b6b; }
+            .bonus-panel.t2 { border-color: #4ecdc4; }
+            .bonus-panel h4 { margin-bottom: 6px; font-size: 0.95rem; }
+            .bonus-panel.t1 h4 { color: #ff6b6b; }
+            .bonus-panel.t2 h4 { color: #4ecdc4; }
+            .bonus-item {
+                font-size: 0.85rem;
+                padding: 3px 0;
+                color: #bbb;
+            }
+            .bonus-item .bonus-civ {
+                color: #ffd700;
+                font-weight: 600;
+            }
+            .no-bonuses { color: #666; font-size: 0.85rem; font-style: italic; }
+
+            /* Role Cards */
+            .roles-row {
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 16px;
+                margin-bottom: 20px;
+            }
+            @media (max-width: 700px) {
+                .roles-row { grid-template-columns: 1fr; }
+            }
+            .roles-panel {
+                background: rgba(255, 255, 255, 0.04);
+                border-radius: 8px;
+                padding: 12px 16px;
+                border-left: 4px solid;
+            }
+            .roles-panel.t1 { border-color: #ff6b6b; }
+            .roles-panel.t2 { border-color: #4ecdc4; }
+            .roles-panel h4 { margin-bottom: 8px; font-size: 0.95rem; }
+            .roles-panel.t1 h4 { color: #ff6b6b; }
+            .roles-panel.t2 h4 { color: #4ecdc4; }
+
+            .role-card {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                padding: 8px 10px;
+                background: rgba(255, 255, 255, 0.03);
+                border-radius: 6px;
+                margin-bottom: 6px;
+            }
+            .role-card .role-civ-emblem {
+                width: 32px;
+                height: 32px;
+                border-radius: 4px;
+            }
+            .role-card .role-info {
+                flex: 1;
+            }
+            .role-card .role-civ-name {
+                font-weight: 600;
+                font-size: 0.9rem;
+            }
+            .role-badge {
+                display: inline-block;
+                padding: 2px 8px;
+                border-radius: 10px;
+                font-size: 0.7rem;
+                font-weight: 700;
+                text-transform: uppercase;
+            }
+            .role-badge.mobile {
+                background: rgba(255, 183, 77, 0.2);
+                color: #ffb74d;
+            }
+            .role-badge.ranged {
+                background: rgba(100, 181, 246, 0.2);
+                color: #64b5f6;
+            }
+            .role-badge.melee_siege {
+                background: rgba(239, 83, 80, 0.2);
+                color: #ef5350;
+            }
+
+            /* Unit Recommendation Cards */
+            .recs-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+                gap: 12px;
+                margin-bottom: 20px;
+            }
+            .rec-card {
+                background: rgba(255, 255, 255, 0.04);
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 8px;
+                padding: 14px;
+            }
+            .rec-card .rec-header {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                margin-bottom: 10px;
+            }
+            .rec-card .rec-civ-emblem {
+                width: 28px;
+                height: 28px;
+                border-radius: 4px;
+            }
+            .rec-card .rec-civ-name {
+                font-weight: 600;
+                font-size: 0.95rem;
+            }
+            .rec-units {
+                display: flex;
+                flex-direction: column;
+                gap: 6px;
+            }
+            .rec-unit {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                padding: 4px 8px;
+                background: rgba(255, 255, 255, 0.03);
+                border-radius: 4px;
+            }
+            .rec-unit .unit-icon {
+                width: 32px;
+                height: 32px;
+                border-radius: 4px;
+            }
+            .rec-unit .unit-name {
+                font-size: 0.85rem;
+                font-weight: 500;
+            }
+            .rec-unit .unit-reason {
+                font-size: 0.7rem;
+                color: #888;
+                margin-left: auto;
+            }
+
+            /* Army Simulation */
+            .army-section {
+                background: rgba(255, 255, 255, 0.04);
+                border-radius: 8px;
+                padding: 16px;
+                margin-bottom: 20px;
+            }
+            .army-loading {
+                text-align: center;
+                color: #888;
+                padding: 20px;
+            }
+            .army-loading .spinner {
+                display: inline-block;
+                width: 24px;
+                height: 24px;
+                border: 3px solid rgba(255, 215, 0, 0.2);
+                border-top-color: #ffd700;
+                border-radius: 50%;
+                animation: spin 0.8s linear infinite;
+                margin-right: 8px;
+                vertical-align: middle;
+            }
+            @keyframes spin { to { transform: rotate(360deg); } }
+
+            .army-result {
+                text-align: center;
+            }
+            .army-winner {
+                font-size: 1.3rem;
+                font-weight: 700;
+                margin-bottom: 10px;
+            }
+            .army-winner.t1 { color: #ff6b6b; }
+            .army-winner.t2 { color: #4ecdc4; }
+            .army-winner.draw { color: #ffd700; }
+
+            .army-details {
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 16px;
+                margin-top: 12px;
+            }
+            @media (max-width: 700px) {
+                .army-details { grid-template-columns: 1fr; }
+            }
+            .army-team {
+                background: rgba(255, 255, 255, 0.03);
+                border-radius: 6px;
+                padding: 10px;
+            }
+            .army-team h5 {
+                font-size: 0.85rem;
+                margin-bottom: 6px;
+            }
+            .army-team.t1 h5 { color: #ff6b6b; }
+            .army-team.t2 h5 { color: #4ecdc4; }
+            .army-unit-row {
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                padding: 2px 0;
+                font-size: 0.8rem;
+            }
+            .army-unit-row .unit-icon {
+                width: 24px;
+                height: 24px;
+                border-radius: 3px;
+            }
+            .army-count {
+                color: #ffd700;
+                font-weight: 600;
+                margin-left: auto;
+            }
+            .army-strategy {
+                font-size: 0.8rem;
+                color: #888;
+                margin-top: 8px;
+            }
+            .army-hp {
+                display: flex;
+                justify-content: center;
+                gap: 30px;
+                margin-top: 8px;
+                font-size: 0.85rem;
+            }
+            .army-hp .t1-hp { color: #ff6b6b; }
+            .army-hp .t2-hp { color: #4ecdc4; }
+
+            /* Unit badge (reused from matchup_advisor) */
+            .unit-badge {
+                display: inline-flex;
+                align-items: center;
+                gap: 4px;
+            }
+
+            /* Skeleton loading */
+            .skeleton {
+                background: linear-gradient(90deg, rgba(255,255,255,0.04) 25%, rgba(255,255,255,0.08) 50%, rgba(255,255,255,0.04) 75%);
+                background-size: 200% 100%;
+                animation: shimmer 1.5s infinite;
+                border-radius: 6px;
+                height: 20px;
+                margin: 6px 0;
+            }
+            @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+
+            .team1-color { color: #ff6b6b; }
+            .team2-color { color: #4ecdc4; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <header>
+                <h1>4v4 Team Advisor</h1>
+                <p class="subtitle">
+                    Pick 4 civs per team. Get role assignments, unit recommendations, and army simulations.
+                </p>
+                <nav class="nav-links">
+                    <a href="/" class="nav-link">Home</a>
+                    <a href="/matchup-advisor" class="nav-link">Civ Matchup</a>
+                    <a href="/team-advisor" class="nav-link active">Team Advisor</a>
+                </nav>
+            </header>
+
+            <div class="team-selector">
+                <div class="team-panel team1">
+                    <div class="team-label">Team 1 (Red)</div>
+                    <div class="team-picks" id="t1-picks"></div>
+                    <div class="civ-grid" id="t1-grid"></div>
+                </div>
+                <div class="team-panel team2">
+                    <div class="team-label">Team 2 (Teal)</div>
+                    <div class="team-picks" id="t2-picks"></div>
+                    <div class="civ-grid" id="t2-grid"></div>
+                </div>
+            </div>
+
+            <button id="analyze-btn" class="compare-btn" disabled>
+                Analyze Teams
+            </button>
+
+            <div id="results" class="results-container"></div>
+        </div>
+
+        <script>
+            /* ---- Icon system (same as matchup_advisor) ---- */
+            const ICON_BASE = "https://aoe2techtree.net/img/Units/";
+            const NAME_TO_ICON = {
+                "Spearman":93,"Pikeman":358,"Halberdier":359,
+                "Man-at-Arms":75,"Long Swordsman":77,"Two-Handed Swordsman":473,"Champion":567,
+                "Eagle Scout":751,"Eagle Warrior":753,"Elite Eagle Warrior":752,
+                "Archer":4,"Crossbowman":24,"Arbalester":492,
+                "Skirmisher":7,"Elite Skirmisher":6,
+                "Cavalry Archer":39,"Heavy Cavalry Archer":474,"Hand Cannoneer":5,
+                "Scout Cavalry":448,"Light Cavalry":546,"Hussar":441,"Winged Hussar":1707,
+                "Knight":38,"Cavalier":283,"Paladin":569,"Savar":569,
+                "Camel Rider":329,"Heavy Camel Rider":330,
+                "Steppe Lancer":1370,"Elite Steppe Lancer":1372,
+                "Battering Ram":1258,"Capped Ram":422,"Siege Ram":548,
+                "Mangonel":280,"Onager":550,"Siege Onager":588,
+                "Rocket Cart":1904,"Heavy Rocket Cart":1907,
+                "Scorpion":279,"Heavy Scorpion":542,"Bombard Cannon":36,"Trebuchet":331,
+                "Longbowman":8,"Elite Longbowman":8,
+                "Cataphract":40,"Elite Cataphract":40,
+                "Woad Raider":232,"Elite Woad Raider":232,
+                "Chu Ko Nu":73,"Elite Chu Ko Nu":73,
+                "Throwing Axeman":281,"Elite Throwing Axeman":281,
+                "Huskarl":41,"Elite Huskarl":41,
+                "Samurai":291,"Elite Samurai":291,
+                "Mangudai":11,"Elite Mangudai":11,
+                "War Elephant":239,"Elite War Elephant":239,
+                "Mameluke":282,"Elite Mameluke":282,
+                "Teutonic Knight":25,"Elite Teutonic Knight":25,
+                "Janissary":46,"Elite Janissary":46,
+                "Berserk":692,"Elite Berserk":692,
+                "Fire Lancer":1901,"Elite Fire Lancer":1903,
+                "Jaguar Warrior":725,"Elite Jaguar Warrior":726,
+                "Plumed Archer":763,"Elite Plumed Archer":765,
+                "Tarkan":755,"Elite Tarkan":757,
+                "War Wagon":827,"Elite War Wagon":829,
+                "Conquistador":771,"Elite Conquistador":773,
+                "Kamayuk":879,"Elite Kamayuk":879,
+                "Genoese Crossbowman":866,"Elite Genoese Crossbowman":866,
+                "Magyar Huszar":869,"Elite Magyar Huszar":869,
+                "Boyar":876,"Elite Boyar":876,
+                "Condottiero":882,"Slinger":185,
+            };
+            function iconUrl(id) { return ICON_BASE + id + ".png"; }
+            function unitIconUrl(name) { const id = NAME_TO_ICON[name]; return id ? iconUrl(id) : ""; }
+            function unitBadge(name, size) {
+                size = size || "sm";
+                const url = unitIconUrl(name);
+                const px = size === "sm" ? 28 : 48;
+                const img = url
+                    ? `<img src="${url}" class="unit-icon" width="${px}" height="${px}" alt="${name}" onerror="this.style.display='none'">`
+                    : '';
+                return `<span class="unit-badge">${img}<span class="unit-name">${name}</span></span>`;
+            }
+
+            /* ---- Civ data ---- */
+            const CDN = "https://backend.cdn.aoe2companion.com/public/aoe2/de/civilizations/";
+            const CIVS = {{ civs | tojson }};
+
+            /* ---- State ---- */
+            let team1 = [], team2 = [];
+            const analyzeBtn = document.getElementById("analyze-btn");
+            const resultsEl = document.getElementById("results");
+
+            /* ---- Build civ grids ---- */
+            function buildGrid(containerId, picksId, team, teamKey) {
+                const grid = document.getElementById(containerId);
+                const picks = document.getElementById(picksId);
+
+                // Build pick slots
+                for (let i = 0; i < 4; i++) {
+                    const slot = document.createElement("div");
+                    slot.className = "pick-slot";
+                    slot.dataset.idx = i;
+                    slot.innerHTML = `<span style="font-size:1.2rem;color:#444">${i + 1}</span>`;
+                    picks.appendChild(slot);
+                }
+
+                // Build civ cards
+                CIVS.forEach(name => {
+                    const slug = name.toLowerCase();
+                    const card = document.createElement("div");
+                    card.className = "civ-card";
+                    card.dataset.civ = name;
+                    card.dataset.team = teamKey;
+                    const img = document.createElement("img");
+                    img.className = "civ-emblem";
+                    img.src = CDN + slug + ".png";
+                    img.alt = name;
+                    img.loading = "lazy";
+                    const label = document.createElement("span");
+                    label.className = "civ-card-name";
+                    label.textContent = name;
+                    card.appendChild(img);
+                    card.appendChild(label);
+                    card.addEventListener("click", () => onCivClick(name, teamKey));
+                    grid.appendChild(card);
+                });
+            }
+
+            buildGrid("t1-grid", "t1-picks", team1, "team1");
+            buildGrid("t2-grid", "t2-picks", team2, "team2");
+
+            function onCivClick(name, teamKey) {
+                const team = teamKey === "team1" ? team1 : team2;
+                const other = teamKey === "team1" ? team2 : team1;
+
+                // Already in other team? ignore
+                if (other.includes(name)) return;
+
+                const idx = team.indexOf(name);
+                if (idx >= 0) {
+                    // Deselect
+                    team.splice(idx, 1);
+                } else if (team.length < 4) {
+                    team.push(name);
+                }
+                updateAllGrids();
+            }
+
+            function removePick(teamKey, idx) {
+                const team = teamKey === "team1" ? team1 : team2;
+                team.splice(idx, 1);
+                updateAllGrids();
+            }
+
+            function updateAllGrids() {
+                const allSelected = new Set([...team1, ...team2]);
+
+                // Update cards in both grids
+                document.querySelectorAll(".civ-card").forEach(card => {
+                    const name = card.dataset.civ;
+                    const teamKey = card.dataset.team;
+                    const myTeam = teamKey === "team1" ? team1 : team2;
+                    const otherTeam = teamKey === "team1" ? team2 : team1;
+
+                    card.classList.remove("selected-team1", "selected-team2", "disabled");
+
+                    if (team1.includes(name) && teamKey === "team1") {
+                        card.classList.add("selected-team1");
+                    } else if (team2.includes(name) && teamKey === "team2") {
+                        card.classList.add("selected-team2");
+                    } else if (otherTeam.includes(name) || myTeam.length >= 4) {
+                        card.classList.add("disabled");
+                    }
+                });
+
+                // Update pick slots
+                updatePicks("t1-picks", team1, "team1");
+                updatePicks("t2-picks", team2, "team2");
+
+                analyzeBtn.disabled = !(team1.length === 4 && team2.length === 4);
+            }
+
+            function updatePicks(picksId, team, teamKey) {
+                const picks = document.getElementById(picksId);
+                const slots = picks.querySelectorAll(".pick-slot");
+                slots.forEach((slot, i) => {
+                    if (i < team.length) {
+                        const name = team[i];
+                        const slug = name.toLowerCase();
+                        slot.className = "pick-slot filled";
+                        slot.innerHTML = `
+                            <img class="pick-emblem" src="${CDN}${slug}.png" alt="${name}">
+                            <span class="pick-name">${name}</span>
+                            <button class="remove-btn" onclick="event.stopPropagation(); removePick('${teamKey}', ${i})">&times;</button>
+                        `;
+                    } else {
+                        slot.className = "pick-slot";
+                        slot.innerHTML = `<span style="font-size:1.2rem;color:#444">${i + 1}</span>`;
+                    }
+                });
+            }
+
+            /* ---- Analysis ---- */
+            let currentData = null;
+            let currentArmyData = null;
+            let currentAge = "imperial";
+
+            analyzeBtn.addEventListener("click", async () => {
+                if (team1.length !== 4 || team2.length !== 4) return;
+                analyzeBtn.disabled = true;
+
+                const t1 = team1.join(",");
+                const t2 = team2.join(",");
+
+                // Show skeleton
+                resultsEl.className = "results-container visible";
+                resultsEl.innerHTML = `
+                    <div class="age-tabs">
+                        <button class="age-tab active" data-age="imperial">Imperial Age</button>
+                        <button class="age-tab" data-age="castle">Castle Age</button>
+                    </div>
+                    <div class="skeleton" style="height:60px"></div>
+                    <div class="skeleton" style="height:120px"></div>
+                    <div class="skeleton" style="height:200px"></div>
+                `;
+
+                try {
+                    const resp = await fetch(`/api/team-advisor/analysis?team1=${encodeURIComponent(t1)}&team2=${encodeURIComponent(t2)}`);
+                    if (!resp.ok) {
+                        const err = await resp.json();
+                        throw new Error(err.error || "Analysis failed");
+                    }
+                    currentData = await resp.json();
+                    currentAge = "imperial";
+                    renderResults();
+
+                    // Fetch army sim in background
+                    fetch(`/api/team-advisor/army?team1=${encodeURIComponent(t1)}&team2=${encodeURIComponent(t2)}`)
+                        .then(r => r.json())
+                        .then(army => {
+                            currentArmyData = army;
+                            renderArmySection();
+                        })
+                        .catch(e => {
+                            document.querySelectorAll(".army-loading").forEach(el => {
+                                el.innerHTML = `<div style="color:#e74c3c;">Army sim failed: ${e.message}</div>`;
+                            });
+                        });
+
+                } catch (e) {
+                    resultsEl.innerHTML = `<div style="text-align:center;color:#e74c3c;padding:20px;">Error: ${e.message}</div>`;
+                }
+
+                analyzeBtn.disabled = false;
+            });
+
+            function renderResults() {
+                if (!currentData) return;
+                const ages = currentData.ages;
+                const ageData = ages[currentAge];
+                if (!ageData) return;
+
+                let html = `
+                    <div class="age-tabs">
+                        <button class="age-tab ${currentAge === 'imperial' ? 'active' : ''}" data-age="imperial">Imperial Age</button>
+                        <button class="age-tab ${currentAge === 'castle' ? 'active' : ''}" data-age="castle">Castle Age</button>
+                    </div>
+                `;
+
+                const t1 = ageData.team1;
+                const t2 = ageData.team2;
+
+                // Section 1: Team Bonuses
+                html += `<div class="section-title">Team Bonuses</div>`;
+                html += `<div class="bonuses-row">`;
+                html += renderBonusPanel(t1.bonuses, "Team 1", "t1");
+                html += renderBonusPanel(t2.bonuses, "Team 2", "t2");
+                html += `</div>`;
+
+                // Section 2: Role Assignments
+                html += `<div class="section-title">Role Assignments</div>`;
+                html += `<div class="roles-row">`;
+                html += renderRolesPanel(t1.roles, currentData.team1, "Team 1", "t1");
+                html += renderRolesPanel(t2.roles, currentData.team2, "Team 2", "t2");
+                html += `</div>`;
+
+                // Section 3: Unit Recommendations
+                html += `<div class="section-title">Unit Recommendations</div>`;
+                html += `<div class="recs-grid">`;
+                for (const civ of currentData.team1) {
+                    const role = t1.roles[civ]?.role || "melee_siege";
+                    const recs = t1.recommendations[civ] || [];
+                    html += renderRecCard(civ, role, recs, "t1");
+                }
+                for (const civ of currentData.team2) {
+                    const role = t2.roles[civ]?.role || "melee_siege";
+                    const recs = t2.recommendations[civ] || [];
+                    html += renderRecCard(civ, role, recs, "t2");
+                }
+                html += `</div>`;
+
+                // Section 4: Army Simulation (loading placeholder)
+                html += `<div class="section-title">Army Simulation</div>`;
+                html += `<div class="army-section" id="army-section">`;
+                if (currentArmyData) {
+                    html += renderArmyResult();
+                } else {
+                    html += `<div class="army-loading"><span class="spinner"></span> Running army simulation...</div>`;
+                }
+                html += `</div>`;
+
+                resultsEl.innerHTML = html;
+
+                // Bind age tabs
+                document.querySelectorAll(".age-tab").forEach(tab => {
+                    tab.addEventListener("click", () => {
+                        currentAge = tab.dataset.age;
+                        renderResults();
+                    });
+                });
+            }
+
+            function renderBonusPanel(bonuses, label, cls) {
+                let html = `<div class="bonus-panel ${cls}"><h4>${label} Bonuses</h4>`;
+                if (bonuses && bonuses.length > 0) {
+                    for (const b of bonuses) {
+                        html += `<div class="bonus-item"><span class="bonus-civ">${b.civ}:</span> ${b.desc}</div>`;
+                    }
+                } else {
+                    html += `<div class="no-bonuses">No team bonuses active</div>`;
+                }
+                html += `</div>`;
+                return html;
+            }
+
+            function renderRolesPanel(roles, civList, label, cls) {
+                let html = `<div class="roles-panel ${cls}"><h4>${label} Roles</h4>`;
+                for (const civ of civList) {
+                    const r = roles[civ];
+                    if (!r) continue;
+                    const slug = civ.toLowerCase();
+                    const roleLabel = r.role === "melee_siege" ? "Melee + Siege" : r.role.charAt(0).toUpperCase() + r.role.slice(1);
+                    html += `
+                        <div class="role-card">
+                            <img class="role-civ-emblem" src="${CDN}${slug}.png" alt="${civ}">
+                            <div class="role-info">
+                                <div class="role-civ-name">${civ}</div>
+                                <span class="role-badge ${r.role}">${roleLabel}</span>
+                            </div>
+                        </div>
+                    `;
+                }
+                html += `</div>`;
+                return html;
+            }
+
+            function renderRecCard(civ, role, recs, cls) {
+                const slug = civ.toLowerCase();
+                const roleLabel = role === "melee_siege" ? "Melee + Siege" : role.charAt(0).toUpperCase() + role.slice(1);
+                const borderColor = cls === "t1" ? "rgba(255,107,107,0.3)" : "rgba(78,205,196,0.3)";
+                let html = `<div class="rec-card" style="border-color:${borderColor}">`;
+                html += `<div class="rec-header">`;
+                html += `<img class="rec-civ-emblem" src="${CDN}${slug}.png" alt="${civ}">`;
+                html += `<span class="rec-civ-name">${civ}</span>`;
+                html += `<span class="role-badge ${role}" style="margin-left:auto">${roleLabel}</span>`;
+                html += `</div>`;
+                html += `<div class="rec-units">`;
+                if (recs.length === 0) {
+                    html += `<div style="color:#666;font-size:0.8rem;">No recommendation</div>`;
+                }
+                for (const rec of recs) {
+                    const url = unitIconUrl(rec.name);
+                    const img = url ? `<img class="unit-icon" src="${url}" width="32" height="32" alt="${rec.name}" onerror="this.style.display='none'">` : "";
+                    html += `
+                        <div class="rec-unit">
+                            ${img}
+                            <span class="unit-name">${rec.name}</span>
+                            <span class="unit-reason">${rec.reasoning}</span>
+                        </div>
+                    `;
+                }
+                html += `</div></div>`;
+                return html;
+            }
+
+            function renderArmySection() {
+                const section = document.getElementById("army-section");
+                if (!section) return;
+                section.innerHTML = renderArmyResult();
+            }
+
+            function renderArmyResult() {
+                if (!currentArmyData || !currentArmyData.ages) return `<div style="color:#666;">No army data</div>`;
+                const sim = currentArmyData.ages[currentAge];
+                if (!sim || !sim.simulation) return `<div style="color:#666;">No simulation data for this age</div>`;
+
+                const s = sim.simulation;
+                const winnerCls = s.winner === "team1" ? "t1" : (s.winner === "team2" ? "t2" : "draw");
+                const winnerLabel = s.winner === "team1" ? "Team 1 Wins!" : (s.winner === "team2" ? "Team 2 Wins!" : "Draw!");
+
+                let html = `<div class="army-result">`;
+                html += `<div class="army-winner ${winnerCls}">${winnerLabel}</div>`;
+                html += `<div class="army-hp">`;
+                html += `<span class="t1-hp">Team 1 HP: ${s.hp_pct_team1}%</span>`;
+                html += `<span class="t2-hp">Team 2 HP: ${s.hp_pct_team2}%</span>`;
+                html += `</div>`;
+                html += `<div class="army-strategy">Strategy: ${s.strategy}</div>`;
+
+                html += `<div class="army-details">`;
+                // Team 1 army
+                html += `<div class="army-team t1"><h5>Team 1 Army</h5>`;
+                for (const u of (s.army_team1 || [])) {
+                    const url = unitIconUrl(u.name);
+                    const img = url ? `<img class="unit-icon" src="${url}" width="24" height="24" onerror="this.style.display='none'">` : "";
+                    html += `<div class="army-unit-row">${img}<span>${u.name}</span><span class="army-count">x${u.count}</span></div>`;
+                }
+                html += `</div>`;
+                // Team 2 army
+                html += `<div class="army-team t2"><h5>Team 2 Army</h5>`;
+                for (const u of (s.army_team2 || [])) {
+                    const url = unitIconUrl(u.name);
+                    const img = url ? `<img class="unit-icon" src="${url}" width="24" height="24" onerror="this.style.display='none'">` : "";
+                    html += `<div class="army-unit-row">${img}<span>${u.name}</span><span class="army-count">x${u.count}</span></div>`;
+                }
+                html += `</div>`;
+                html += `</div></div>`;
+                return html;
+            }
+        </script>
+    </body>
+</html>

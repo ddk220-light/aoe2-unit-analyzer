@@ -2825,6 +2825,705 @@ def api_matchup_advisor_vote():
     return jsonify({"status": "ok"})
 
 
+# ============== 4v4 Team Advisor ==============
+
+# Team bonus definitions (cross-civ bonuses applied at runtime)
+# The ref DB already has each civ's OWN bonuses baked in; these are the
+# bonuses that benefit *allies* when a civ is on the team.
+_TEAM_BONUSES = {
+    "Britons": {
+        "type": "work_rate",
+        "desc": "Archery Range work rate +10%",
+        "affected": "ranged_gold",
+        "cost_reduction": 0.10,
+    },
+    "Goths": {
+        "type": "work_rate",
+        "desc": "Barracks work rate +20%",
+        "affected": "melee_infantry",
+        "cost_reduction": 0.15,
+    },
+    "Celts": {
+        "type": "work_rate",
+        "desc": "Siege Workshop work rate +20%",
+        "affected": "siege",
+        "cost_reduction": 0.15,
+    },
+    "Persians": {
+        "type": "attack_bonus",
+        "desc": "Knights +2 vs Archers",
+        "unit_filter": lambda cu: cu["movement_speed"] > _MOBILE_SPEED_THRESHOLD
+        and cu["cost_gold"] > 0
+        and cu["attack_range"] <= 1.0,
+        "bonus_class": 15,
+        "bonus_amount": 2,
+    },
+    "Saracens": {
+        "type": "attack_bonus",
+        "desc": "Foot archers +3 vs Buildings",
+        "unit_filter": lambda cu: cu["attack_range"] > 1.0
+        and cu["movement_speed"] <= _MOBILE_SPEED_THRESHOLD,
+        "bonus_class": 21,
+        "bonus_amount": 3,
+    },
+    "Italians": {
+        "type": "ally_unit",
+        "desc": "Condottiero available to all allies",
+        "unit_slug": "condottiero",
+    },
+}
+
+_MELEE_INFANTRY_CLASSES = {
+    "Infantry",
+    "Spearman",
+}
+
+
+def _is_melee_infantry(cu):
+    cls = cu.get("_unit_class_name", "")
+    return cls in _MELEE_INFANTRY_CLASSES and cu["attack_range"] <= 1.0
+
+
+def _apply_team_bonuses(team_civs, units_by_civ, ref_cursor, db_age):
+    """Apply cross-civ team bonuses. Modifies units_by_civ in place.
+    Returns list of active bonus descriptions for display."""
+    import copy
+
+    active_bonuses = []
+
+    for source_civ in team_civs:
+        bonus = _TEAM_BONUSES.get(source_civ)
+        if not bonus:
+            continue
+
+        # Apply to all OTHER civs on the team (source civ already has its own bonus)
+        other_civs = [c for c in team_civs if c != source_civ]
+
+        if bonus["type"] == "work_rate":
+            reduction = bonus["cost_reduction"]
+            for civ in other_civs:
+                for slug, cu in units_by_civ[civ].items():
+                    applies = False
+                    if bonus["affected"] == "ranged_gold":
+                        applies = cu["attack_range"] > 1.0 and cu["cost_gold"] > 0
+                    elif bonus["affected"] == "melee_infantry":
+                        applies = _is_melee_infantry(cu)
+                    elif bonus["affected"] == "siege":
+                        applies = cu.get("_unit_class_name", "") in _SIEGE_CLASSES
+                    if applies:
+                        cu["cost_food"] = int(cu["cost_food"] * (1 - reduction))
+                        cu["cost_wood"] = int(cu["cost_wood"] * (1 - reduction))
+                        cu["cost_gold"] = int(cu["cost_gold"] * (1 - reduction))
+            active_bonuses.append(
+                {"civ": source_civ, "desc": bonus["desc"]}
+            )
+
+        elif bonus["type"] == "attack_bonus":
+            filt = bonus["unit_filter"]
+            bc = bonus["bonus_class"]
+            ba = bonus["bonus_amount"]
+            for civ in other_civs:
+                for slug, cu in units_by_civ[civ].items():
+                    if filt(cu):
+                        attacks = cu.get("attacks", {})
+                        attacks[bc] = attacks.get(bc, 0) + ba
+                        cu["attacks"] = attacks
+            active_bonuses.append(
+                {"civ": source_civ, "desc": bonus["desc"]}
+            )
+
+        elif bonus["type"] == "ally_unit":
+            unit_slug = bonus["unit_slug"]
+            # Load the Condottiero from the source civ and give to allies
+            for civ in other_civs:
+                if unit_slug not in units_by_civ[civ]:
+                    # Try loading from Italians' units in the ref DB
+                    ref_cursor.execute(
+                        "SELECT * FROM ref_units WHERE civ_name=? AND unit_slug=? AND age=?",
+                        (source_civ, unit_slug, db_age),
+                    )
+                    row = ref_cursor.fetchone()
+                    if row:
+                        combat_dict = _build_combat_dict_from_ref(ref_cursor, row)
+                        cu = prepare_combat_unit(combat_dict)
+                        cu["_display_name"] = row["unit_name"]
+                        cu["_slug"] = unit_slug
+                        cu["_unit_type"] = row["unit_type"]
+                        cu["_unit_class_name"] = row["unit_class_name"] or ""
+                        units_by_civ[civ][unit_slug] = cu
+            active_bonuses.append(
+                {"civ": source_civ, "desc": bonus["desc"]}
+            )
+
+    return active_bonuses
+
+
+def _score_civ_mobile(civ_units, civ_cats, all_opp_mobile, calc_cost, is_imperial, cache):
+    """Score a civ's mobile units vs ALL opposing team's mobile units. Returns total score."""
+    my_mobile = civ_cats["mobile"]
+    if not my_mobile or not all_opp_mobile:
+        return 0
+    total = 0
+    for my_slug, my_cu in my_mobile.items():
+        for opp_cu in all_opp_mobile:
+            _, s1, _ = _run_pair(my_cu, opp_cu, calc_cost, is_imperial, cache=cache)
+            total += s1
+    return total
+
+
+def _score_civ_ranged(civ_units, civ_cats, opp_targets, calc_cost, is_imperial, cache):
+    """Score a civ's ranged_gold units vs opposing ranged + mobile units."""
+    my_ranged = civ_cats["ranged_gold"]
+    if not my_ranged or not opp_targets:
+        return 0
+    total = 0
+    for my_slug, my_cu in my_ranged.items():
+        for opp_cu in opp_targets:
+            _, s1, _ = _run_pair(my_cu, opp_cu, calc_cost, is_imperial, cache=cache)
+            total += s1
+    return total
+
+
+def _assign_roles(team_civs, units_by_civ, cats_by_civ, opp_team_civs,
+                  opp_units_by_civ, opp_cats_by_civ, calc_cost, is_imperial, cache):
+    """Assign roles (mobile/ranged/melee_siege) to each civ on the team.
+    Returns dict {civ_name: role_string}."""
+
+    # Gather all opposing mobile units (flat list for scoring)
+    all_opp_mobile = []
+    for opp_civ in opp_team_civs:
+        for slug, cu in opp_cats_by_civ[opp_civ]["mobile"].items():
+            all_opp_mobile.append(cu)
+
+    # Gather all opposing ranged + mobile units
+    all_opp_ranged_mobile = list(all_opp_mobile)
+    for opp_civ in opp_team_civs:
+        for slug, cu in opp_cats_by_civ[opp_civ]["ranged_gold"].items():
+            all_opp_ranged_mobile.append(cu)
+
+    # Phase 1: Score mobile
+    mobile_scores = {}
+    for civ in team_civs:
+        mobile_scores[civ] = _score_civ_mobile(
+            units_by_civ[civ], cats_by_civ[civ],
+            all_opp_mobile, calc_cost, is_imperial, cache
+        )
+
+    # Sort by mobile score descending
+    sorted_by_mobile = sorted(team_civs, key=lambda c: mobile_scores[c], reverse=True)
+
+    roles = {}
+    assigned = set()
+
+    # Assign top 2 to mobile (3rd if score > 60% of 2nd AND civ has weak ranged)
+    if len(sorted_by_mobile) >= 2 and mobile_scores[sorted_by_mobile[0]] > 0:
+        roles[sorted_by_mobile[0]] = "mobile"
+        assigned.add(sorted_by_mobile[0])
+
+        if mobile_scores[sorted_by_mobile[1]] > 0:
+            roles[sorted_by_mobile[1]] = "mobile"
+            assigned.add(sorted_by_mobile[1])
+
+            # Check 3rd
+            if len(sorted_by_mobile) >= 3:
+                third = sorted_by_mobile[2]
+                second_score = mobile_scores[sorted_by_mobile[1]]
+                if (second_score > 0
+                        and mobile_scores[third] > 0.6 * second_score
+                        and len(cats_by_civ[third]["ranged_gold"]) <= 1):
+                    roles[third] = "mobile"
+                    assigned.add(third)
+
+    # Phase 2: Score ranged from remaining civs
+    remaining = [c for c in team_civs if c not in assigned]
+    ranged_scores = {}
+    for civ in remaining:
+        ranged_scores[civ] = _score_civ_ranged(
+            units_by_civ[civ], cats_by_civ[civ],
+            all_opp_ranged_mobile, calc_cost, is_imperial, cache
+        )
+
+    sorted_by_ranged = sorted(remaining, key=lambda c: ranged_scores.get(c, 0), reverse=True)
+
+    # Assign top 1-2 to ranged
+    ranged_assigned = 0
+    for civ in sorted_by_ranged:
+        if ranged_assigned >= 2:
+            break
+        if ranged_scores.get(civ, 0) > 0 and len(cats_by_civ[civ]["ranged_gold"]) > 0:
+            roles[civ] = "ranged"
+            assigned.add(civ)
+            ranged_assigned += 1
+
+    # Remaining civs get melee_siege role
+    for civ in team_civs:
+        if civ not in assigned:
+            roles[civ] = "melee_siege"
+
+    return roles, mobile_scores, ranged_scores
+
+
+def _recommend_units_for_civ(civ, role, units, cats, opp_cats_combined,
+                             calc_cost, is_imperial, cache):
+    """Recommend 1-2 units for a civ based on its assigned role.
+    Returns list of {slug, name, reasoning}."""
+    recommendations = []
+    all_units = cats["all"]
+    mobile = cats["mobile"]
+    ranged_gold = cats["ranged_gold"]
+    siege = cats["siege"]
+
+    if role == "mobile":
+        # Best mobile unit vs all opponent units
+        best_mob_slug, _ = _find_best_counter(
+            mobile, opp_cats_combined, calc_cost, is_imperial, cache=cache
+        ) if mobile else (None, 0)
+        if best_mob_slug:
+            recommendations.append({
+                "slug": best_mob_slug,
+                "name": all_units[best_mob_slug]["_display_name"],
+                "reasoning": "Best mobile unit",
+            })
+            # Best non-mobile support
+            support_pool = {s: cu for s, cu in all_units.items()
+                           if s != best_mob_slug and s not in mobile}
+            if support_pool:
+                support_slug, _ = _find_best_counter(
+                    support_pool, opp_cats_combined, calc_cost, is_imperial,
+                    exclude={best_mob_slug}, cache=cache
+                )
+                if support_slug:
+                    recommendations.append({
+                        "slug": support_slug,
+                        "name": all_units[support_slug]["_display_name"],
+                        "reasoning": "Support unit",
+                    })
+
+    elif role == "ranged":
+        # Best ranged unit
+        best_ranged_slug, _ = _find_best_counter(
+            ranged_gold, opp_cats_combined, calc_cost, is_imperial, cache=cache
+        ) if ranged_gold else (None, 0)
+        if best_ranged_slug:
+            recommendations.append({
+                "slug": best_ranged_slug,
+                "name": all_units[best_ranged_slug]["_display_name"],
+                "reasoning": "Best ranged unit",
+            })
+            # Best anti-cavalry melee support
+            melee_pool = {s: cu for s, cu in all_units.items()
+                         if cu["attack_range"] <= 1.0 and s != best_ranged_slug}
+            opp_mobile_dict = {k: v for k, v in opp_cats_combined.items()
+                               if v["movement_speed"] > _MOBILE_SPEED_THRESHOLD}
+            target = opp_mobile_dict if opp_mobile_dict else opp_cats_combined
+            if melee_pool:
+                support_slug, _ = _find_best_counter(
+                    melee_pool, target, calc_cost, is_imperial,
+                    exclude={best_ranged_slug}, cache=cache
+                )
+                if support_slug:
+                    recommendations.append({
+                        "slug": support_slug,
+                        "name": all_units[support_slug]["_display_name"],
+                        "reasoning": "Anti-cavalry support",
+                    })
+
+    else:  # melee_siege
+        # Best melee unit
+        melee_pool = {s: cu for s, cu in all_units.items()
+                      if cu["attack_range"] <= 1.0}
+        best_melee_slug, _ = _find_best_counter(
+            melee_pool, opp_cats_combined, calc_cost, is_imperial, cache=cache
+        ) if melee_pool else (None, 0)
+        if best_melee_slug:
+            recommendations.append({
+                "slug": best_melee_slug,
+                "name": all_units[best_melee_slug]["_display_name"],
+                "reasoning": "Best melee unit",
+            })
+            # Best siege/ranged support
+            support_pool = {**ranged_gold, **siege}
+            support_pool.pop(best_melee_slug, None)
+            if support_pool:
+                support_slug, _ = _find_best_counter(
+                    support_pool, opp_cats_combined, calc_cost, is_imperial,
+                    exclude={best_melee_slug}, cache=cache
+                )
+                if support_slug:
+                    recommendations.append({
+                        "slug": support_slug,
+                        "name": all_units[support_slug]["_display_name"],
+                        "reasoning": "Siege/ranged support",
+                    })
+
+    return recommendations
+
+
+def _run_team_analysis(team1_civs, team2_civs):
+    """Run phases 0-3 of team matchup analysis. Returns results dict or raises ValueError."""
+    ref_conn = get_ref_db()
+    rc = ref_conn.cursor()
+
+    # Validate all civs exist
+    for civ in team1_civs + team2_civs:
+        rc.execute("SELECT DISTINCT civ_name FROM ref_units WHERE civ_name=?", (civ,))
+        if not rc.fetchone():
+            ref_conn.close()
+            raise ValueError(f"Civilization '{civ}' not found")
+
+    MATCHUP_AGES = {"imperial": AGES["imperial"], "castle": AGES["castle"]}
+    results = {}
+
+    for age_slug, age_data in MATCHUP_AGES.items():
+        db_age = "Castle" if age_slug == "castle" else "Imperial"
+        is_imperial = age_slug == "imperial"
+
+        def fetch_team_units(civ_name):
+            rc.execute(
+                "SELECT * FROM ref_units WHERE civ_name=? AND age=?",
+                (civ_name, db_age),
+            )
+            units = {}
+            for row in rc.fetchall():
+                slug = row["unit_slug"]
+                if slug in _ADVISOR_EXCLUDED:
+                    continue
+                combat_dict = _build_combat_dict_from_ref(rc, row)
+                cu = prepare_combat_unit(combat_dict)
+                cu["_display_name"] = row["unit_name"]
+                cu["_slug"] = slug
+                cu["_unit_type"] = row["unit_type"]
+                cu["_unit_class_name"] = row["unit_class_name"] or ""
+                units[slug] = cu
+            return units
+
+        # Phase 0: Load all units
+        t1_units = {}
+        t2_units = {}
+        for civ in team1_civs:
+            t1_units[civ] = fetch_team_units(civ)
+        for civ in team2_civs:
+            t2_units[civ] = fetch_team_units(civ)
+
+        # Apply team bonuses
+        t1_bonuses = _apply_team_bonuses(team1_civs, t1_units, rc, db_age)
+        t2_bonuses = _apply_team_bonuses(team2_civs, t2_units, rc, db_age)
+
+        # Categorize units
+        t1_cats = {civ: _categorize_units(units) for civ, units in t1_units.items()}
+        t2_cats = {civ: _categorize_units(units) for civ, units in t2_units.items()}
+
+        def calc_cost(unit):
+            food = unit["cost_food"]
+            wood = unit["cost_wood"]
+            gold = unit["cost_gold"]
+            if is_imperial:
+                cost = wood + food + gold
+            else:
+                cost = wood + 1.5 * food + gold
+            return int(cost) if cost > 0 else 100
+
+        pair_cache = {}
+
+        # Phase 1 & 2: Role assignment
+        t1_roles, t1_mob_scores, t1_rng_scores = _assign_roles(
+            team1_civs, t1_units, t1_cats,
+            team2_civs, t2_units, t2_cats,
+            calc_cost, is_imperial, pair_cache
+        )
+        t2_roles, t2_mob_scores, t2_rng_scores = _assign_roles(
+            team2_civs, t2_units, t2_cats,
+            team1_civs, t1_units, t1_cats,
+            calc_cost, is_imperial, pair_cache
+        )
+
+        # Build combined opponent unit dicts for recommendations
+        t1_all_combined = {}
+        for civ in team1_civs:
+            for slug, cu in t1_units[civ].items():
+                t1_all_combined[f"{civ}_{slug}"] = cu
+        t2_all_combined = {}
+        for civ in team2_civs:
+            for slug, cu in t2_units[civ].items():
+                t2_all_combined[f"{civ}_{slug}"] = cu
+
+        # Phase 3: Unit recommendations per civ
+        t1_recs = {}
+        for civ in team1_civs:
+            t1_recs[civ] = _recommend_units_for_civ(
+                civ, t1_roles[civ], t1_units[civ], t1_cats[civ],
+                t2_all_combined, calc_cost, is_imperial, pair_cache
+            )
+        t2_recs = {}
+        for civ in team2_civs:
+            t2_recs[civ] = _recommend_units_for_civ(
+                civ, t2_roles[civ], t2_units[civ], t2_cats[civ],
+                t1_all_combined, calc_cost, is_imperial, pair_cache
+            )
+
+        results[age_slug] = {
+            "age_name": age_data["name"],
+            "team1": {
+                "bonuses": t1_bonuses,
+                "roles": {civ: {
+                    "role": t1_roles[civ],
+                    "mobile_score": t1_mob_scores.get(civ, 0),
+                    "ranged_score": t1_rng_scores.get(civ, 0),
+                } for civ in team1_civs},
+                "recommendations": {civ: t1_recs[civ] for civ in team1_civs},
+            },
+            "team2": {
+                "bonuses": t2_bonuses,
+                "roles": {civ: {
+                    "role": t2_roles[civ],
+                    "mobile_score": t2_mob_scores.get(civ, 0),
+                    "ranged_score": t2_rng_scores.get(civ, 0),
+                } for civ in team2_civs},
+                "recommendations": {civ: t2_recs[civ] for civ in team2_civs},
+            },
+        }
+
+    ref_conn.close()
+    return results
+
+
+def _run_team_army_sim(team1_civs, team2_civs):
+    """Phase 4: Team army simulation. Returns results per age."""
+    ref_conn = get_ref_db()
+    rc = ref_conn.cursor()
+
+    MATCHUP_AGES = {"imperial": AGES["imperial"], "castle": AGES["castle"]}
+    results = {}
+
+    for age_slug, age_data in MATCHUP_AGES.items():
+        db_age = "Castle" if age_slug == "castle" else "Imperial"
+        is_imperial = age_slug == "imperial"
+
+        def fetch_team_units(civ_name):
+            rc.execute(
+                "SELECT * FROM ref_units WHERE civ_name=? AND age=?",
+                (civ_name, db_age),
+            )
+            units = {}
+            for row in rc.fetchall():
+                slug = row["unit_slug"]
+                if slug in _ADVISOR_EXCLUDED:
+                    continue
+                combat_dict = _build_combat_dict_from_ref(rc, row)
+                cu = prepare_combat_unit(combat_dict)
+                cu["_display_name"] = row["unit_name"]
+                cu["_slug"] = slug
+                cu["_unit_type"] = row["unit_type"]
+                cu["_unit_class_name"] = row["unit_class_name"] or ""
+                units[slug] = cu
+            return units
+
+        def calc_cost(unit):
+            food = unit["cost_food"]
+            wood = unit["cost_wood"]
+            gold = unit["cost_gold"]
+            if is_imperial:
+                cost = wood + food + gold
+            else:
+                cost = wood + 1.5 * food + gold
+            return int(cost) if cost > 0 else 100
+
+        # Load units and apply bonuses
+        t1_units = {civ: fetch_team_units(civ) for civ in team1_civs}
+        t2_units = {civ: fetch_team_units(civ) for civ in team2_civs}
+        _apply_team_bonuses(team1_civs, t1_units, rc, db_age)
+        _apply_team_bonuses(team2_civs, t2_units, rc, db_age)
+
+        t1_cats = {civ: _categorize_units(u) for civ, u in t1_units.items()}
+        t2_cats = {civ: _categorize_units(u) for civ, u in t2_units.items()}
+
+        pair_cache = {}
+
+        # Re-run role assignment to get recommendations
+        t1_roles, _, _ = _assign_roles(
+            team1_civs, t1_units, t1_cats,
+            team2_civs, t2_units, t2_cats,
+            calc_cost, is_imperial, pair_cache
+        )
+        t2_roles, _, _ = _assign_roles(
+            team2_civs, t2_units, t2_cats,
+            team1_civs, t1_units, t1_cats,
+            calc_cost, is_imperial, pair_cache
+        )
+
+        # Get recommended units per civ
+        t1_all_combined = {}
+        for civ in team1_civs:
+            for slug, cu in t1_units[civ].items():
+                t1_all_combined[f"{civ}_{slug}"] = cu
+        t2_all_combined = {}
+        for civ in team2_civs:
+            for slug, cu in t2_units[civ].items():
+                t2_all_combined[f"{civ}_{slug}"] = cu
+
+        t1_recs = {}
+        for civ in team1_civs:
+            t1_recs[civ] = _recommend_units_for_civ(
+                civ, t1_roles[civ], t1_units[civ], t1_cats[civ],
+                t2_all_combined, calc_cost, is_imperial, pair_cache
+            )
+        t2_recs = {}
+        for civ in team2_civs:
+            t2_recs[civ] = _recommend_units_for_civ(
+                civ, t2_roles[civ], t2_units[civ], t2_cats[civ],
+                t1_all_combined, calc_cost, is_imperial, pair_cache
+            )
+
+        # Build army from recommendations (5000 resources per civ = 20000 total)
+        RESOURCES_PER_CIV = 5000
+        # 5 allocation strategies: equal, mobile-heavy, ranged-heavy, melee-heavy, balanced
+        STRATEGIES = [
+            {"name": "Equal", "weights": {"mobile": 1.0, "ranged": 1.0, "melee_siege": 1.0}},
+            {"name": "Mobile-heavy", "weights": {"mobile": 1.5, "ranged": 0.7, "melee_siege": 0.8}},
+            {"name": "Ranged-heavy", "weights": {"mobile": 0.7, "ranged": 1.5, "melee_siege": 0.8}},
+            {"name": "Melee-heavy", "weights": {"mobile": 0.8, "ranged": 0.7, "melee_siege": 1.5}},
+            {"name": "Balanced", "weights": {"mobile": 1.1, "ranged": 1.1, "melee_siege": 0.8}},
+        ]
+
+        def build_army(team_civs, team_units, team_recs, team_roles, strategy):
+            """Build army unit list [(cu, count), ...] for one team with a strategy."""
+            army = []
+            total_weight = sum(strategy["weights"].get(team_roles[c], 1.0) for c in team_civs)
+            total_resources = RESOURCES_PER_CIV * len(team_civs)
+
+            for civ in team_civs:
+                role = team_roles[civ]
+                weight = strategy["weights"].get(role, 1.0)
+                civ_resources = total_resources * (weight / total_weight)
+                recs = team_recs.get(civ, [])
+                if not recs:
+                    continue
+
+                if len(recs) >= 2:
+                    # Split 60/40 between primary and secondary
+                    primary_cu = team_units[civ].get(recs[0]["slug"])
+                    secondary_cu = team_units[civ].get(recs[1]["slug"])
+                    if primary_cu and secondary_cu:
+                        c1 = calc_cost(primary_cu)
+                        c2 = calc_cost(secondary_cu)
+                        cnt1 = max(1, int((civ_resources * 0.6) // c1))
+                        cnt2 = max(1, int((civ_resources * 0.4) // c2))
+                        army.append((primary_cu, cnt1))
+                        army.append((secondary_cu, cnt2))
+                    elif primary_cu:
+                        c1 = calc_cost(primary_cu)
+                        cnt1 = max(1, int(civ_resources // c1))
+                        army.append((primary_cu, cnt1))
+                elif len(recs) == 1:
+                    primary_cu = team_units[civ].get(recs[0]["slug"])
+                    if primary_cu:
+                        c1 = calc_cost(primary_cu)
+                        cnt1 = max(1, int(civ_resources // c1))
+                        army.append((primary_cu, cnt1))
+            return army
+
+        best_result = None
+        best_margin = -999
+        best_strategy = None
+
+        for strat in STRATEGIES:
+            army1 = build_army(team1_civs, t1_units, t1_recs, t1_roles, strat)
+            army2 = build_army(team2_civs, t2_units, t2_recs, t2_roles, strat)
+
+            if not army1 or not army2:
+                continue
+
+            w, _, _, hp1, hp2 = simulate_mixed_battle(army1, army2, return_hp=True)
+            margin = hp1 - hp2
+            if margin > best_margin:
+                best_margin = margin
+                best_result = {
+                    "winner": "team1" if w == 1 else ("team2" if w == 2 else "draw"),
+                    "margin": round(margin, 3),
+                    "hp_pct_team1": round(hp1, 1),
+                    "hp_pct_team2": round(hp2, 1),
+                    "strategy": strat["name"],
+                    "army_team1": [
+                        {"name": cu["_display_name"], "count": cnt}
+                        for cu, cnt in army1
+                    ],
+                    "army_team2": [
+                        {"name": cu["_display_name"], "count": cnt}
+                        for cu, cnt in army2
+                    ],
+                }
+                best_strategy = strat["name"]
+
+        results[age_slug] = {
+            "age_name": age_data["name"],
+            "simulation": best_result,
+            "strategy_used": best_strategy,
+        }
+
+    ref_conn.close()
+    return results
+
+
+def _parse_team_param(param):
+    """Parse comma-separated civ names from query param. Returns list of 4 civs or raises ValueError."""
+    if not param:
+        raise ValueError("Team parameter required")
+    civs = [c.strip() for c in param.split(",") if c.strip()]
+    if len(civs) != 4:
+        raise ValueError(f"Expected 4 civilizations, got {len(civs)}")
+    if len(set(civs)) != 4:
+        raise ValueError("All civilizations must be unique")
+    return civs
+
+
+@app.route("/team-advisor")
+def team_advisor():
+    """4v4 Team Advisor page."""
+    civs = _get_ref_civs()
+    return render_template("team_advisor.html", civs=civs)
+
+
+@app.route("/api/team-advisor/analysis")
+def api_team_advisor_analysis():
+    """Fast endpoint: phases 0-3 of team analysis."""
+    try:
+        team1 = _parse_team_param(request.args.get("team1"))
+        team2 = _parse_team_param(request.args.get("team2"))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    # Ensure no overlap between teams
+    if set(team1) & set(team2):
+        return jsonify({"error": "Teams cannot share civilizations"}), 400
+
+    try:
+        results = _run_team_analysis(team1, team2)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 404
+
+    return jsonify({"team1": team1, "team2": team2, "ages": results})
+
+
+@app.route("/api/team-advisor/army")
+def api_team_advisor_army():
+    """Slow endpoint: phase 4 team army simulation."""
+    try:
+        team1 = _parse_team_param(request.args.get("team1"))
+        team2 = _parse_team_param(request.args.get("team2"))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    if set(team1) & set(team2):
+        return jsonify({"error": "Teams cannot share civilizations"}), 400
+
+    try:
+        results = _run_team_army_sim(team1, team2)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 404
+
+    return jsonify({"team1": team1, "team2": team2, "ages": results})
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
