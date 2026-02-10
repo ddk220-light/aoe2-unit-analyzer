@@ -6,7 +6,7 @@ import urllib.error
 from datetime import datetime, timezone
 from functools import lru_cache
 
-from flask import Flask, jsonify, redirect, render_template, request
+from flask import Flask, Response, jsonify, redirect, render_template, request
 from simulation import prepare_combat_unit, simulate_battle, simulate_mixed_battle
 
 app = Flask(__name__)
@@ -2973,6 +2973,31 @@ def _score_civ_mobile(civ_units, civ_cats, all_opp_mobile, calc_cost, is_imperia
     return total
 
 
+def _heuristic_mobile_score(civ_cats, calc_cost):
+    """Rate a civ's mobile strength by stat efficiency. No simulation - instant.
+    Returns (total_score, best_slug)."""
+    mobile = civ_cats["mobile"]
+    if not mobile:
+        return 0, None
+    best_slug = None
+    best_val = 0
+    total = 0
+    for slug, cu in mobile.items():
+        cost = max(calc_cost(cu), 1)
+        dps = cu["attack"] / max(cu["attack_speed"], 0.1)
+        hp = cu["hp"]
+        armor = cu["melee_armor"] + cu["pierce_armor"]
+        speed = cu["movement_speed"]
+        value = (hp * (1 + armor / 20)) * dps * speed / cost
+        if cu.get("_unit_type") == "Unique":
+            value *= 1.3
+        total += value
+        if value > best_val:
+            best_val = value
+            best_slug = slug
+    return total, best_slug
+
+
 def _score_civ_ranged(civ_units, civ_cats, opp_targets, calc_cost, is_imperial, cache):
     """Score a civ's ranged_gold units vs opposing ranged + mobile units."""
     my_ranged = civ_cats["ranged_gold"]
@@ -2984,6 +3009,50 @@ def _score_civ_ranged(civ_units, civ_cats, opp_targets, calc_cost, is_imperial, 
             _, s1, _ = _run_pair(my_cu, opp_cu, calc_cost, is_imperial, cache=cache)
             total += s1
     return total
+
+
+def _heuristic_ranged_score(civ_cats, calc_cost):
+    """Rate a civ's ranged strength by stat efficiency. No simulation - instant.
+    Returns (total_score, best_slug)."""
+    ranged = civ_cats["ranged_gold"]
+    if not ranged:
+        return 0, None
+    best_slug = None
+    best_val = 0
+    total = 0
+    for slug, cu in ranged.items():
+        cost = max(calc_cost(cu), 1)
+        dps = cu["attack"] / max(cu["attack_speed"], 0.1)
+        hp = cu["hp"]
+        rng = cu["attack_range"]
+        value = dps * (1 + rng / 6) * (hp / cost)
+        if cu.get("_unit_type") == "Unique":
+            value *= 1.3
+        total += value
+        if value > best_val:
+            best_val = value
+            best_slug = slug
+    return total, best_slug
+
+
+def _pick_best_melee(civ_cats, calc_cost):
+    """Pick best melee unit by stat efficiency (no simulation). Returns slug or None."""
+    all_units = civ_cats["all"]
+    melee = {s: cu for s, cu in all_units.items() if cu["attack_range"] <= 1.0}
+    if not melee:
+        return None
+    best_slug = None
+    best_value = -1
+    for slug, cu in melee.items():
+        is_unique = cu.get("_unit_type") == "Unique"
+        cost = max(calc_cost(cu), 1)
+        value = (cu["hp"] * cu["attack"]) / cost
+        if is_unique:
+            value *= 1.5
+        if value > best_value:
+            best_value = value
+            best_slug = slug
+    return best_slug
 
 
 def _assign_roles(team_civs, units_by_civ, cats_by_civ, opp_team_civs,
@@ -3159,6 +3228,273 @@ def _recommend_units_for_civ(civ, role, units, cats, opp_cats_combined,
                     })
 
     return recommendations
+
+
+def _assign_mobile_role(team_civs, mobile_scores, cats_by_civ):
+    """Pick top 2-3 civs for mobile role based on scores. Returns list of civ names."""
+    sorted_civs = sorted(team_civs, key=lambda c: mobile_scores[c], reverse=True)
+    mobile_civs = []
+
+    if len(sorted_civs) >= 2 and mobile_scores[sorted_civs[0]] > 0:
+        mobile_civs.append(sorted_civs[0])
+        if mobile_scores[sorted_civs[1]] > 0:
+            mobile_civs.append(sorted_civs[1])
+            # 3rd civ if score > 60% of 2nd AND weak ranged
+            if len(sorted_civs) >= 3:
+                third = sorted_civs[2]
+                second_score = mobile_scores[sorted_civs[1]]
+                if (second_score > 0
+                        and mobile_scores[third] > 0.6 * second_score
+                        and len(cats_by_civ[third]["ranged_gold"]) <= 1):
+                    mobile_civs.append(third)
+
+    return mobile_civs
+
+
+def _assign_ranged_role(remaining_civs, ranged_scores, cats_by_civ):
+    """Pick top 1-2 civs for ranged role from remaining civs. Returns list of civ names."""
+    sorted_civs = sorted(remaining_civs, key=lambda c: ranged_scores.get(c, 0), reverse=True)
+    ranged_civs = []
+
+    for civ in sorted_civs:
+        if len(ranged_civs) >= 2:
+            break
+        if ranged_scores.get(civ, 0) > 0 and len(cats_by_civ[civ]["ranged_gold"]) > 0:
+            ranged_civs.append(civ)
+
+    return ranged_civs
+
+
+def _make_calc_cost(is_imperial):
+    """Create a cost calculation function for the given age."""
+    def calc_cost(unit):
+        food = unit["cost_food"]
+        wood = unit["cost_wood"]
+        gold = unit["cost_gold"]
+        if is_imperial:
+            cost = wood + food + gold
+        else:
+            cost = wood + 1.5 * food + gold
+        return int(cost) if cost > 0 else 100
+    return calc_cost
+
+
+def _run_team_analysis_phased(team1_civs, team2_civs):
+    """Generator yielding results phase by phase for SSE streaming.
+
+    Yields dicts with 'phase' key: 'bonuses' -> 'mobile' -> 'ranged' -> 'melee_siege' -> 'done'.
+    """
+    ref_conn = get_ref_db()
+    rc = ref_conn.cursor()
+
+    # Validate all civs exist
+    for civ in team1_civs + team2_civs:
+        rc.execute("SELECT DISTINCT civ_name FROM ref_units WHERE civ_name=?", (civ,))
+        if not rc.fetchone():
+            ref_conn.close()
+            raise ValueError(f"Civilization '{civ}' not found")
+
+    MATCHUP_AGES = {"imperial": AGES["imperial"], "castle": AGES["castle"]}
+
+    # Pre-load all unit data and bonuses for both ages
+    age_state = {}
+    bonuses_ages = {}
+
+    for age_slug, age_info in MATCHUP_AGES.items():
+        db_age = "Castle" if age_slug == "castle" else "Imperial"
+        is_imperial = age_slug == "imperial"
+
+        def _fetch(civ_name, _db_age=db_age):
+            rc.execute("SELECT * FROM ref_units WHERE civ_name=? AND age=?", (civ_name, _db_age))
+            units = {}
+            for row in rc.fetchall():
+                slug = row["unit_slug"]
+                if slug in _ADVISOR_EXCLUDED:
+                    continue
+                combat_dict = _build_combat_dict_from_ref(rc, row)
+                cu = prepare_combat_unit(combat_dict)
+                cu["_display_name"] = row["unit_name"]
+                cu["_slug"] = slug
+                cu["_unit_type"] = row["unit_type"]
+                cu["_unit_class_name"] = row["unit_class_name"] or ""
+                units[slug] = cu
+            return units
+
+        t1_units = {civ: _fetch(civ) for civ in team1_civs}
+        t2_units = {civ: _fetch(civ) for civ in team2_civs}
+
+        t1_bonuses = _apply_team_bonuses(team1_civs, t1_units, rc, db_age)
+        t2_bonuses = _apply_team_bonuses(team2_civs, t2_units, rc, db_age)
+
+        t1_cats = {civ: _categorize_units(u) for civ, u in t1_units.items()}
+        t2_cats = {civ: _categorize_units(u) for civ, u in t2_units.items()}
+
+        calc_cost = _make_calc_cost(is_imperial)
+
+        age_state[age_slug] = {
+            "is_imperial": is_imperial,
+            "t1_units": t1_units, "t2_units": t2_units,
+            "t1_cats": t1_cats, "t2_cats": t2_cats,
+            "calc_cost": calc_cost,
+        }
+        bonuses_ages[age_slug] = {"t1": t1_bonuses, "t2": t2_bonuses}
+
+    # --- Yield Phase 0: Bonuses ---
+    yield {
+        "phase": "bonuses",
+        "team1": team1_civs,
+        "team2": team2_civs,
+        "ages": {
+            age_slug: {
+                "team1": {"bonuses": bonuses_ages[age_slug]["t1"]},
+                "team2": {"bonuses": bonuses_ages[age_slug]["t2"]},
+            }
+            for age_slug in MATCHUP_AGES
+        },
+    }
+
+    # Track role assignments per age
+    roles_state = {a: {"t1_mobile": [], "t2_mobile": [], "t1_ranged": [], "t2_ranged": []} for a in MATCHUP_AGES}
+
+    # --- Yield Phase 1: Mobile (heuristic scoring - instant) ---
+    mobile_out = {"phase": "mobile", "ages": {}}
+    for age_slug in MATCHUP_AGES:
+        st = age_state[age_slug]
+
+        t1_mob = {}
+        t1_mob_best = {}
+        for civ in team1_civs:
+            score, best = _heuristic_mobile_score(st["t1_cats"][civ], st["calc_cost"])
+            t1_mob[civ] = score
+            t1_mob_best[civ] = best
+        t2_mob = {}
+        t2_mob_best = {}
+        for civ in team2_civs:
+            score, best = _heuristic_mobile_score(st["t2_cats"][civ], st["calc_cost"])
+            t2_mob[civ] = score
+            t2_mob_best[civ] = best
+
+        t1_mobile_civs = _assign_mobile_role(team1_civs, t1_mob, st["t1_cats"])
+        t2_mobile_civs = _assign_mobile_role(team2_civs, t2_mob, st["t2_cats"])
+        roles_state[age_slug]["t1_mobile"] = t1_mobile_civs
+        roles_state[age_slug]["t2_mobile"] = t2_mobile_civs
+
+        # Recommendations from scoring data (no extra sims)
+        def _mobile_rec(civ, best_slug, units_dict):
+            if not best_slug or best_slug not in units_dict:
+                return []
+            return [{"slug": best_slug,
+                     "name": units_dict[best_slug]["_display_name"],
+                     "reasoning": "Best mobile unit"}]
+
+        t1_recs = {c: _mobile_rec(c, t1_mob_best[c], st["t1_units"][c]) for c in t1_mobile_civs}
+        t2_recs = {c: _mobile_rec(c, t2_mob_best[c], st["t2_units"][c]) for c in t2_mobile_civs}
+
+        mobile_out["ages"][age_slug] = {
+            "team1": {
+                "roles": {c: {"role": "mobile", "mobile_score": t1_mob[c]} for c in t1_mobile_civs},
+                "recommendations": t1_recs,
+            },
+            "team2": {
+                "roles": {c: {"role": "mobile", "mobile_score": t2_mob[c]} for c in t2_mobile_civs},
+                "recommendations": t2_recs,
+            },
+        }
+    yield mobile_out
+
+    # --- Yield Phase 2: Ranged (heuristic scoring - instant) ---
+    ranged_out = {"phase": "ranged", "ages": {}}
+    for age_slug in MATCHUP_AGES:
+        st = age_state[age_slug]
+        rs = roles_state[age_slug]
+
+        t1_remaining = [c for c in team1_civs if c not in rs["t1_mobile"]]
+        t2_remaining = [c for c in team2_civs if c not in rs["t2_mobile"]]
+
+        t1_rng = {}
+        t1_rng_best = {}
+        for civ in t1_remaining:
+            score, best = _heuristic_ranged_score(st["t1_cats"][civ], st["calc_cost"])
+            t1_rng[civ] = score
+            t1_rng_best[civ] = best
+        t2_rng = {}
+        t2_rng_best = {}
+        for civ in t2_remaining:
+            score, best = _heuristic_ranged_score(st["t2_cats"][civ], st["calc_cost"])
+            t2_rng[civ] = score
+            t2_rng_best[civ] = best
+
+        t1_ranged_civs = _assign_ranged_role(t1_remaining, t1_rng, st["t1_cats"])
+        t2_ranged_civs = _assign_ranged_role(t2_remaining, t2_rng, st["t2_cats"])
+        rs["t1_ranged"] = t1_ranged_civs
+        rs["t2_ranged"] = t2_ranged_civs
+
+        def _ranged_rec(civ, best_slug, units_dict):
+            if not best_slug or best_slug not in units_dict:
+                return []
+            return [{"slug": best_slug,
+                     "name": units_dict[best_slug]["_display_name"],
+                     "reasoning": "Best ranged unit"}]
+
+        t1_recs = {c: _ranged_rec(c, t1_rng_best[c], st["t1_units"][c]) for c in t1_ranged_civs}
+        t2_recs = {c: _ranged_rec(c, t2_rng_best[c], st["t2_units"][c]) for c in t2_ranged_civs}
+
+        ranged_out["ages"][age_slug] = {
+            "team1": {
+                "roles": {c: {"role": "ranged", "ranged_score": t1_rng[c]} for c in t1_ranged_civs},
+                "recommendations": t1_recs,
+            },
+            "team2": {
+                "roles": {c: {"role": "ranged", "ranged_score": t2_rng[c]} for c in t2_ranged_civs},
+                "recommendations": t2_recs,
+            },
+        }
+    yield ranged_out
+
+    # --- Yield Phase 3: Melee + Siege (heuristic - no simulation) ---
+    melee_out = {"phase": "melee_siege", "ages": {}}
+    for age_slug in MATCHUP_AGES:
+        st = age_state[age_slug]
+        rs = roles_state[age_slug]
+
+        t1_assigned = set(rs["t1_mobile"]) | set(rs["t1_ranged"])
+        t2_assigned = set(rs["t2_mobile"]) | set(rs["t2_ranged"])
+        t1_melee = [c for c in team1_civs if c not in t1_assigned]
+        t2_melee = [c for c in team2_civs if c not in t2_assigned]
+
+        def _melee_rec(civ, units_dict, cats):
+            best_slug = _pick_best_melee(cats, st["calc_cost"])
+            recs = []
+            if best_slug and best_slug in units_dict:
+                recs.append({"slug": best_slug,
+                             "name": units_dict[best_slug]["_display_name"],
+                             "reasoning": "Best melee unit"})
+            # Suggest siege support
+            siege = cats["siege"]
+            if siege:
+                best_siege = max(siege.keys(), key=lambda s: siege[s]["attack"])
+                recs.append({"slug": best_siege,
+                             "name": siege[best_siege]["_display_name"],
+                             "reasoning": "Siege support"})
+            return recs
+
+        t1_recs = {c: _melee_rec(c, st["t1_units"][c], st["t1_cats"][c]) for c in t1_melee}
+        t2_recs = {c: _melee_rec(c, st["t2_units"][c], st["t2_cats"][c]) for c in t2_melee}
+
+        melee_out["ages"][age_slug] = {
+            "team1": {
+                "roles": {c: {"role": "melee_siege"} for c in t1_melee},
+                "recommendations": t1_recs,
+            },
+            "team2": {
+                "roles": {c: {"role": "melee_siege"} for c in t2_melee},
+                "recommendations": t2_recs,
+            },
+        }
+    yield melee_out
+
+    ref_conn.close()
+    yield {"phase": "done"}
 
 
 def _run_team_analysis(team1_civs, team2_civs):
@@ -3524,6 +3860,36 @@ def api_team_advisor_army():
         return jsonify({"error": str(e)}), 404
 
     return jsonify({"team1": team1, "team2": team2, "ages": results})
+
+
+@app.route("/api/team-advisor/analysis-stream")
+def api_team_advisor_analysis_stream():
+    """SSE endpoint: progressive team analysis (bonuses -> mobile -> ranged -> melee_siege)."""
+    try:
+        team1_civs = _parse_team_param(request.args.get("team1"))
+        team2_civs = _parse_team_param(request.args.get("team2"))
+    except ValueError as e:
+        def err():
+            yield f"data: {json.dumps({'phase': 'error', 'error': str(e)})}\n\n"
+        return Response(err(), mimetype="text/event-stream")
+
+    if set(team1_civs) & set(team2_civs):
+        def err():
+            yield f"data: {json.dumps({'phase': 'error', 'error': 'Teams cannot share civilizations'})}\n\n"
+        return Response(err(), mimetype="text/event-stream")
+
+    def generate():
+        try:
+            for phase_data in _run_team_analysis_phased(team1_civs, team2_civs):
+                yield f"data: {json.dumps(phase_data)}\n\n"
+        except ValueError as e:
+            yield f"data: {json.dumps({'phase': 'error', 'error': str(e)})}\n\n"
+
+    return Response(
+        generate(),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.route("/api/team-advisor/matches")

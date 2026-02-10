@@ -933,19 +933,26 @@
                 });
             }
 
-            /* ---- Analysis ---- */
+            /* ---- Analysis (SSE progressive loading) ---- */
             let currentData = null;
             let currentArmyData = null;
             let currentAge = "imperial";
+            let completedPhases = new Set();
 
-            analyzeBtn.addEventListener("click", async () => {
+            analyzeBtn.addEventListener("click", () => {
                 if (team1.length !== 4 || team2.length !== 4) return;
                 analyzeBtn.disabled = true;
 
                 const t1 = team1.join(",");
                 const t2 = team2.join(",");
 
-                // Show skeleton
+                // Reset state
+                currentData = { team1: [...team1], team2: [...team2], ages: {} };
+                currentArmyData = null;
+                completedPhases = new Set();
+                currentAge = "imperial";
+
+                // Show initial skeleton
                 resultsEl.className = "results-container visible";
                 resultsEl.innerHTML = `
                     <div class="age-tabs">
@@ -957,35 +964,72 @@
                     <div class="skeleton" style="height:200px"></div>
                 `;
 
-                try {
-                    const resp = await fetch(`/api/team-advisor/analysis?team1=${encodeURIComponent(t1)}&team2=${encodeURIComponent(t2)}`);
-                    if (!resp.ok) {
-                        const err = await resp.json();
-                        throw new Error(err.error || "Analysis failed");
+                // Open SSE connection
+                const url = `/api/team-advisor/analysis-stream?team1=${encodeURIComponent(t1)}&team2=${encodeURIComponent(t2)}`;
+                const evtSource = new EventSource(url);
+
+                evtSource.onmessage = (event) => {
+                    const data = JSON.parse(event.data);
+
+                    if (data.phase === "error") {
+                        resultsEl.innerHTML = `<div style="text-align:center;color:#e74c3c;padding:20px;">Error: ${data.error}</div>`;
+                        evtSource.close();
+                        analyzeBtn.disabled = false;
+                        return;
                     }
-                    currentData = await resp.json();
-                    currentAge = "imperial";
-                    renderResults();
 
-                    // Fetch army sim in background
-                    fetch(`/api/team-advisor/army?team1=${encodeURIComponent(t1)}&team2=${encodeURIComponent(t2)}`)
-                        .then(r => r.json())
-                        .then(army => {
-                            currentArmyData = army;
-                            renderArmySection();
-                        })
-                        .catch(e => {
-                            document.querySelectorAll(".army-loading").forEach(el => {
-                                el.innerHTML = `<div style="color:#e74c3c;">Army sim failed: ${e.message}</div>`;
+                    if (data.phase === "done") {
+                        evtSource.close();
+                        analyzeBtn.disabled = false;
+                        // Start army sim
+                        fetch(`/api/team-advisor/army?team1=${encodeURIComponent(t1)}&team2=${encodeURIComponent(t2)}`)
+                            .then(r => r.json())
+                            .then(army => { currentArmyData = army; renderArmySection(); })
+                            .catch(e => {
+                                const el = document.getElementById("army-section");
+                                if (el) el.innerHTML = `<div style="color:#e74c3c;">Army sim failed: ${e.message}</div>`;
                             });
-                        });
+                        return;
+                    }
 
-                } catch (e) {
-                    resultsEl.innerHTML = `<div style="text-align:center;color:#e74c3c;padding:20px;">Error: ${e.message}</div>`;
-                }
+                    // Merge phase data into currentData
+                    mergePhaseData(data);
+                    completedPhases.add(data.phase);
+                    renderResults();
+                };
 
-                analyzeBtn.disabled = false;
+                evtSource.onerror = () => {
+                    evtSource.close();
+                    if (completedPhases.size === 0) {
+                        resultsEl.innerHTML = `<div style="text-align:center;color:#e74c3c;padding:20px;">Connection lost. Please try again.</div>`;
+                    }
+                    analyzeBtn.disabled = false;
+                };
             });
+
+            function mergePhaseData(phaseData) {
+                if (phaseData.team1 && Array.isArray(phaseData.team1)) {
+                    currentData.team1 = phaseData.team1;
+                }
+                if (phaseData.team2 && Array.isArray(phaseData.team2)) {
+                    currentData.team2 = phaseData.team2;
+                }
+                for (const [age, ageInfo] of Object.entries(phaseData.ages || {})) {
+                    if (!currentData.ages[age]) {
+                        currentData.ages[age] = {
+                            team1: { bonuses: [], roles: {}, recommendations: {} },
+                            team2: { bonuses: [], roles: {}, recommendations: {} },
+                        };
+                    }
+                    for (const tk of ["team1", "team2"]) {
+                        const src = ageInfo[tk] || {};
+                        const dst = currentData.ages[age][tk];
+                        if (src.bonuses) dst.bonuses = src.bonuses;
+                        Object.assign(dst.roles, src.roles || {});
+                        Object.assign(dst.recommendations, src.recommendations || {});
+                    }
+                }
+            }
 
             function renderResults() {
                 if (!currentData) return;
@@ -1004,43 +1048,58 @@
                 const t2 = ageData.team2;
 
                 // Section 1: Team Bonuses
-                html += `<div class="section-title">Team Bonuses</div>`;
-                html += `<div class="bonuses-row">`;
-                html += renderBonusPanel(t1.bonuses, "Team 1", "t1");
-                html += renderBonusPanel(t2.bonuses, "Team 2", "t2");
-                html += `</div>`;
+                if (completedPhases.has("bonuses")) {
+                    html += `<div class="section-title">Team Bonuses</div>`;
+                    html += `<div class="bonuses-row">`;
+                    html += renderBonusPanel(t1.bonuses, "Team 1", "t1");
+                    html += renderBonusPanel(t2.bonuses, "Team 2", "t2");
+                    html += `</div>`;
+                }
 
-                // Section 2: Role Assignments
+                // Section 2: Role Assignments (progressive)
                 html += `<div class="section-title">Role Assignments</div>`;
                 html += `<div class="roles-row">`;
                 html += renderRolesPanel(t1.roles, currentData.team1, "Team 1", "t1");
                 html += renderRolesPanel(t2.roles, currentData.team2, "Team 2", "t2");
                 html += `</div>`;
+                if (!completedPhases.has("melee_siege")) {
+                    const nextPhase = !completedPhases.has("mobile") ? "mobile units"
+                                    : !completedPhases.has("ranged") ? "ranged units"
+                                    : "melee + siege";
+                    html += `<div style="text-align:center;color:#888;padding:4px 0 12px;"><span class="spinner"></span> Analyzing ${nextPhase}...</div>`;
+                }
 
-                // Section 3: Unit Recommendations
-                html += `<div class="section-title">Unit Recommendations</div>`;
-                html += `<div class="recs-grid">`;
-                for (const civ of currentData.team1) {
-                    const role = t1.roles[civ]?.role || "melee_siege";
-                    const recs = t1.recommendations[civ] || [];
-                    html += renderRecCard(civ, role, recs, "t1");
+                // Section 3: Unit Recommendations (progressive)
+                const assignedCivs = new Set(Object.keys(t1.roles || {}).concat(Object.keys(t2.roles || {})));
+                if (assignedCivs.size > 0) {
+                    html += `<div class="section-title">Unit Recommendations</div>`;
+                    html += `<div class="recs-grid">`;
+                    for (const civ of currentData.team1) {
+                        if (!t1.roles[civ]) continue;
+                        const role = t1.roles[civ].role;
+                        const recs = t1.recommendations[civ] || [];
+                        html += renderRecCard(civ, role, recs, "t1");
+                    }
+                    for (const civ of currentData.team2) {
+                        if (!t2.roles[civ]) continue;
+                        const role = t2.roles[civ].role;
+                        const recs = t2.recommendations[civ] || [];
+                        html += renderRecCard(civ, role, recs, "t2");
+                    }
+                    html += `</div>`;
                 }
-                for (const civ of currentData.team2) {
-                    const role = t2.roles[civ]?.role || "melee_siege";
-                    const recs = t2.recommendations[civ] || [];
-                    html += renderRecCard(civ, role, recs, "t2");
-                }
-                html += `</div>`;
 
-                // Section 4: Army Simulation (loading placeholder)
-                html += `<div class="section-title">Army Simulation</div>`;
-                html += `<div class="army-section" id="army-section">`;
-                if (currentArmyData) {
-                    html += renderArmyResult();
-                } else {
-                    html += `<div class="army-loading"><span class="spinner"></span> Running army simulation...</div>`;
+                // Section 4: Army Simulation
+                if (completedPhases.has("melee_siege")) {
+                    html += `<div class="section-title">Army Simulation</div>`;
+                    html += `<div class="army-section" id="army-section">`;
+                    if (currentArmyData) {
+                        html += renderArmyResult();
+                    } else {
+                        html += `<div class="army-loading"><span class="spinner"></span> Running army simulation...</div>`;
+                    }
+                    html += `</div>`;
                 }
-                html += `</div>`;
 
                 resultsEl.innerHTML = html;
 
