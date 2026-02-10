@@ -529,6 +529,85 @@
 
             .team1-color { color: #ff6b6b; }
             .team2-color { color: #4ecdc4; }
+
+            /* --- Match Loader --- */
+            .match-loader {
+                background: rgba(255, 255, 255, 0.03);
+                border: 2px solid rgba(255, 215, 0, 0.15);
+                border-radius: 12px;
+                padding: 16px 20px;
+                margin-bottom: 20px;
+            }
+            .match-loader h3 {
+                font-size: 1rem;
+                color: #ffd700;
+                margin-bottom: 12px;
+            }
+            .match-loader-row {
+                display: flex;
+                gap: 10px;
+                align-items: center;
+                flex-wrap: wrap;
+            }
+            .match-loader-row input {
+                padding: 8px 12px;
+                border-radius: 6px;
+                border: 1px solid rgba(255, 255, 255, 0.15);
+                background: rgba(255, 255, 255, 0.06);
+                color: #e4e4e4;
+                font-size: 0.9rem;
+                width: 180px;
+            }
+            .match-loader-row input::placeholder { color: #666; }
+            .match-loader-row button {
+                padding: 8px 16px;
+                border-radius: 6px;
+                border: none;
+                background: rgba(255, 215, 0, 0.2);
+                color: #ffd700;
+                font-weight: 600;
+                cursor: pointer;
+                transition: all 0.2s;
+                font-size: 0.85rem;
+            }
+            .match-loader-row button:hover { background: rgba(255, 215, 0, 0.3); }
+            .match-loader-row button:disabled { opacity: 0.4; cursor: not-allowed; }
+            .match-loader-row select {
+                padding: 8px 12px;
+                border-radius: 6px;
+                border: 1px solid rgba(255, 255, 255, 0.15);
+                background: rgba(255, 255, 255, 0.06);
+                color: #e4e4e4;
+                font-size: 0.85rem;
+                flex: 1;
+                min-width: 200px;
+                max-width: 500px;
+            }
+            .match-loader-row select option { background: #1a1a2e; color: #e4e4e4; }
+            .match-load-btn {
+                padding: 8px 16px;
+                border-radius: 6px;
+                border: none;
+                background: linear-gradient(135deg, #4ecdc4, #44a08d);
+                color: #fff;
+                font-weight: 600;
+                cursor: pointer;
+                transition: all 0.2s;
+                font-size: 0.85rem;
+            }
+            .match-load-btn:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(78, 205, 196, 0.3); }
+            .match-load-btn:disabled { opacity: 0.4; cursor: not-allowed; transform: none; box-shadow: none; }
+            .match-status {
+                font-size: 0.8rem;
+                color: #888;
+                margin-top: 8px;
+            }
+            .match-status.error { color: #e74c3c; }
+            .match-unsupported {
+                font-size: 0.75rem;
+                color: #e67e22;
+                margin-top: 4px;
+            }
         </style>
     </head>
     <body>
@@ -544,6 +623,19 @@
                     <a href="/team-advisor" class="nav-link active">Team Advisor</a>
                 </nav>
             </header>
+
+            <div class="match-loader">
+                <h3>Load from Recent Match</h3>
+                <div class="match-loader-row">
+                    <input type="text" id="profile-id" placeholder="AoE2 Profile ID" />
+                    <button id="fetch-matches-btn" onclick="fetchMatches()">Find Matches</button>
+                    <select id="match-select" disabled>
+                        <option value="">-- Select a match --</option>
+                    </select>
+                    <button id="load-match-btn" class="match-load-btn" disabled onclick="loadSelectedMatch()">Load Civs</button>
+                </div>
+                <div id="match-status" class="match-status"></div>
+            </div>
 
             <div class="team-selector">
                 <div class="team-panel team1">
@@ -623,6 +715,108 @@
             /* ---- Civ data ---- */
             const CDN = "https://backend.cdn.aoe2companion.com/public/aoe2/de/civilizations/";
             const CIVS = {{ civs | tojson }};
+
+            /* ---- Match Loader ---- */
+            let matchesData = [];
+            const CIVS_SET = new Set(CIVS);
+
+            async function fetchMatches() {
+                const profileId = document.getElementById("profile-id").value.trim();
+                if (!profileId) return;
+
+                const statusEl = document.getElementById("match-status");
+                const fetchBtn = document.getElementById("fetch-matches-btn");
+                const select = document.getElementById("match-select");
+                const loadBtn = document.getElementById("load-match-btn");
+
+                fetchBtn.disabled = true;
+                statusEl.className = "match-status";
+                statusEl.textContent = "Fetching matches...";
+                select.disabled = true;
+                loadBtn.disabled = true;
+
+                try {
+                    const resp = await fetch(`/api/team-advisor/matches?profile_id=${encodeURIComponent(profileId)}`);
+                    if (!resp.ok) {
+                        const err = await resp.json();
+                        throw new Error(err.error || "Fetch failed");
+                    }
+                    const data = await resp.json();
+                    matchesData = data.matches || [];
+
+                    if (matchesData.length === 0) {
+                        statusEl.textContent = "No team games found for this profile.";
+                        statusEl.className = "match-status error";
+                        return;
+                    }
+
+                    // Populate dropdown
+                    select.innerHTML = '<option value="">-- Select a match --</option>';
+                    matchesData.forEach((m, i) => {
+                        const opt = document.createElement("option");
+                        opt.value = i;
+                        const t1civs = m.teams[0].map(p => p.civ).join(", ");
+                        const t2civs = m.teams[1].map(p => p.civ).join(", ");
+                        const playerSide = m.player_team ? ` [You: Team ${m.player_team}]` : "";
+                        opt.textContent = `${m.date} | ${m.map} | ${t1civs} vs ${t2civs}${playerSide}`;
+                        select.appendChild(opt);
+                    });
+                    select.disabled = false;
+                    select.selectedIndex = 1; // auto-select first match
+                    loadBtn.disabled = false;
+                    statusEl.textContent = `Found ${matchesData.length} team game(s).`;
+
+                } catch (e) {
+                    statusEl.textContent = `Error: ${e.message}`;
+                    statusEl.className = "match-status error";
+                } finally {
+                    fetchBtn.disabled = false;
+                }
+            }
+
+            function loadSelectedMatch() {
+                const select = document.getElementById("match-select");
+                const statusEl = document.getElementById("match-status");
+                const idx = parseInt(select.value);
+                if (isNaN(idx) || !matchesData[idx]) return;
+
+                const match = matchesData[idx];
+
+                // Clear current selections
+                team1.length = 0;
+                team2.length = 0;
+
+                // Load civs, filtering to supported ones and limiting to 4 per team
+                const unsupported = [];
+                for (let ti = 0; ti < 2; ti++) {
+                    const team = ti === 0 ? team1 : team2;
+                    for (const p of match.teams[ti]) {
+                        if (!CIVS_SET.has(p.civ)) {
+                            unsupported.push(p.civ);
+                            continue;
+                        }
+                        // Don't add duplicates or if already on other team
+                        const other = ti === 0 ? team2 : team1;
+                        if (!team.includes(p.civ) && !other.includes(p.civ) && team.length < 4) {
+                            team.push(p.civ);
+                        }
+                    }
+                }
+
+                updateAllGrids();
+
+                let msg = `Loaded: ${team1.join(", ")} vs ${team2.join(", ")}`;
+                if (unsupported.length > 0) {
+                    msg += ` (unsupported: ${[...new Set(unsupported)].join(", ")})`;
+                }
+                statusEl.textContent = msg;
+                statusEl.className = "match-status";
+            }
+
+            // Allow Enter key to trigger fetch
+            document.getElementById("profile-id").addEventListener("keydown", (e) => {
+                if (e.key === "Enter") fetchMatches();
+            });
 
             /* ---- State ---- */
             let team1 = [], team2 = [];

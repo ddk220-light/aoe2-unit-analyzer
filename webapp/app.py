@@ -1,6 +1,8 @@
 import json
 import os
 import sqlite3
+import urllib.request
+import urllib.error
 from datetime import datetime, timezone
 from functools import lru_cache
 
@@ -3522,6 +3524,96 @@ def api_team_advisor_army():
         return jsonify({"error": str(e)}), 404
 
     return jsonify({"team1": team1, "team2": team2, "ages": results})
+
+
+@app.route("/api/team-advisor/matches")
+def api_team_advisor_matches():
+    """Fetch recent team game matches for a player from aoe2companion."""
+    profile_id = request.args.get("profile_id", "").strip()
+    if not profile_id:
+        return jsonify({"error": "profile_id parameter required"}), 400
+
+    # Fetch from aoe2companion API
+    url = f"https://data.aoe2companion.com/api/matches?profile_ids={profile_id}&count=50"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "AoE2UnitAnalyzer/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        return jsonify({"error": f"API returned {e.code}"}), 502
+    except (urllib.error.URLError, TimeoutError):
+        return jsonify({"error": "Could not reach aoe2companion API"}), 502
+    except json.JSONDecodeError:
+        return jsonify({"error": "Invalid response from API"}), 502
+
+    # Get supported civs from our DB
+    supported_civs = set(_get_ref_civs())
+
+    # API sometimes uses different names than our DB
+    _CIV_NAME_MAP = {
+        "Inca": "Incas",
+    }
+
+    # Filter for team games (2 teams, 3-4 players per team)
+    matches_out = []
+    for m in data.get("matches", []):
+        teams = m.get("teams", [])
+        if len(teams) != 2:
+            continue
+        team_sizes = [len(t.get("players", [])) for t in teams]
+        if not all(3 <= s <= 4 for s in team_sizes):
+            continue
+
+        # Extract civs per team
+        team_civs = []
+        for t in teams:
+            civs = []
+            for p in t.get("players", []):
+                civ_name = p.get("civName", "")
+                civ_name = _CIV_NAME_MAP.get(civ_name, civ_name)
+                civs.append({
+                    "name": p.get("name", "Unknown"),
+                    "civ": civ_name,
+                    "supported": civ_name in supported_civs,
+                    "profile_id": p.get("profileId"),
+                    "won": p.get("won"),
+                })
+            team_civs.append(civs)
+
+        # Find which team the searched player is on
+        player_team = None
+        for ti, t in enumerate(teams):
+            for p in t.get("players", []):
+                if str(p.get("profileId")) == str(profile_id):
+                    player_team = ti + 1
+                    break
+            if player_team:
+                break
+
+        started = m.get("started")
+        date_str = ""
+        if started:
+            try:
+                if isinstance(started, (int, float)):
+                    dt = datetime.fromtimestamp(started, tz=timezone.utc)
+                    date_str = dt.strftime("%Y-%m-%d %H:%M")
+                else:
+                    # ISO string format from API
+                    date_str = str(started)[:16].replace("T", " ")
+            except (ValueError, OSError):
+                date_str = str(started)
+
+        matches_out.append({
+            "match_id": m.get("matchId"),
+            "date": date_str,
+            "map": m.get("mapName", "Unknown"),
+            "leaderboard": m.get("leaderboardName", ""),
+            "num_players": sum(team_sizes),
+            "player_team": player_team,
+            "teams": team_civs,
+        })
+
+    return jsonify({"matches": matches_out, "supported_civs": sorted(supported_civs)})
 
 
 if __name__ == "__main__":
